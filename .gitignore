@@ -1,3 +1,6 @@
+# AI agent guidelines (internal tooling, not for version control)
+AGENTS.md
+
 # Secrets
 .env
 
