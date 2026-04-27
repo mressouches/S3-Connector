@@ -16,7 +16,7 @@ Environment variables:
 """
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -130,12 +130,159 @@ def _render_connection_form() -> Optional[S3Client]:
     return st.session_state.get("s3_client")
 
 
-def _render_file_browser(client: S3Client) -> None:
-    """Render the file browser table and download buttons.
+def _build_tree(objects: List[S3Object], base_prefix: str) -> Dict:
+    """Build a nested dict tree from a flat list of S3 objects.
 
-    Fetches the object list from S3, applies the user's name filter, and
-    displays each object with its size, modification date, and a download
+    Each leaf node is an S3Object instance. Each intermediate node is a dict
+    whose keys are child folder/file names.
+
+    S3 folder-placeholder objects (keys ending with "/", typically zero-byte)
+    are skipped so they do not shadow real folder dicts in the tree.
+
+    If a folder segment was previously stored as an S3Object (edge case with
+    some S3-compatible stores), it is replaced with a dict so that child
+    objects can be nested correctly.
+
+    Example output for keys ["a/b/file.txt", "a/other.csv"]:
+        {"a": {"b": {"file.txt": <S3Object>}, "other.csv": <S3Object>}}
+
+    Args:
+        objects: Flat list of S3Object instances.
+        base_prefix: The root prefix that was used to query S3. It is stripped
+                     from each key before building the tree so that the tree
+                     starts relative to that prefix.
+
+    Returns:
+        Nested dict representing the folder/file hierarchy.
+    """
+    tree: Dict = {}
+    for obj in objects:
+        # Skip S3 folder-placeholder objects (zero-byte keys ending with "/")
+        if obj.key.endswith("/"):
+            continue
+        relative_key = (
+            obj.key[len(base_prefix):]
+            if obj.key.startswith(base_prefix)
+            else obj.key
+        )
+        parts = [p for p in relative_key.split("/") if p]
+        if not parts:
+            continue
+        node = tree
+        for part in parts[:-1]:
+            existing = node.get(part)
+            if not isinstance(existing, dict):
+                # Either missing or previously stored as a folder-placeholder
+                # S3Object — replace with a real dict so children can be added.
+                node[part] = {}
+            node = node[part]
+        node[parts[-1]] = obj
+    return tree
+
+
+def _render_file_row(obj: object, client: S3Client) -> None:
+    """Render a single file row with name, size, date and download button.
+
+    Accepts any object that exposes the S3Object attributes (key, size,
+    last_modified) so that hot-reload class identity issues do not crash
+    the render loop.
+
+    Args:
+        obj: An S3Object (or duck-typed equivalent) to display.
+        client: An authenticated S3Client for downloading.
+    """
+    try:
+        key: str = obj.key  # type: ignore[attr-defined]
+        size: int = obj.size  # type: ignore[attr-defined]
+        last_modified = obj.last_modified  # type: ignore[attr-defined]
+    except AttributeError:
+        logger.warning("Skipping unrecognised object in file browser: %r", obj)
+        return
+
+    cols = st.columns([5, 2, 3, 2])
+    cols[0].markdown(f"📄 `{_filename(key)}`")
+    cols[1].text(_format_size(size))
+    cols[2].text(last_modified.strftime("%Y-%m-%d %H:%M"))
+    if cols[3].button("⬇ Download", key=f"dl_{key}", use_container_width=True):
+        _download_object(client, key)
+
+
+def _render_tree(tree: Dict, client: S3Client, depth: int = 0, path: str = "") -> None:
+    """Recursively render a folder tree with toggle buttons for directories.
+
+    Streamlit does not support nested expanders, so folders at every depth are
+    rendered as toggle buttons backed by st.session_state. Clicking a folder
+    button opens or closes it. Sub-folders are rendered recursively in an
+    indented container. Files are shown as rows with size, date, and a download
     button.
+
+    Args:
+        tree: Nested dict produced by _build_tree.
+        client: An authenticated S3Client for downloading.
+        depth: Current recursion depth, used for indentation and unique keys.
+        path: Slash-joined path of ancestor folder names, used to build unique
+              session_state keys for each folder toggle.
+    """
+    folders = [(k, v) for k, v in sorted(tree.items()) if isinstance(v, dict)]
+    # Treat any non-dict leaf as a file regardless of its exact type, so that
+    # dataclass identity issues after hot-reloads do not drop items silently.
+    files = [(k, v) for k, v in sorted(tree.items()) if not isinstance(v, dict)]
+
+    for folder_name, subtree in folders:
+        folder_path = f"{path}/{folder_name}"
+        state_key = f"folder_open_{folder_path}"
+        is_open = st.session_state.get(state_key, False)
+        file_count = _count_files(subtree)
+        icon = "📂" if is_open else "📁"
+        # Visual indentation: use non-breaking spaces in the markdown label
+        indent = "\u00a0" * (depth * 6)
+        label = f"{indent}{icon}  {folder_name}  —  {file_count} file{'s' if file_count != 1 else ''}"
+
+        if st.button(label, key=f"folder_btn_{folder_path}", use_container_width=True):
+            st.session_state[state_key] = not is_open
+
+        if st.session_state.get(state_key, False):
+            _render_tree(subtree, client, depth + 1, folder_path)
+
+    if files:
+        header = st.columns([5, 2, 3, 2])
+        header[0].markdown("**Name**")
+        header[1].markdown("**Size**")
+        header[2].markdown("**Last modified**")
+        header[3].markdown("**Download**")
+        for _, obj in files:
+            _render_file_row(obj, client)
+
+
+def _count_files(tree: object) -> int:
+    """Count the total number of leaf files in a tree dict recursively.
+
+    Accepts any value: returns 0 immediately for non-dict inputs so that
+    defensive callers never trigger an AttributeError.
+
+    Args:
+        tree: Nested dict produced by _build_tree, or any leaf value.
+
+    Returns:
+        Total number of S3Object leaves under this node.
+    """
+    if not isinstance(tree, dict):
+        return 0
+    total = 0
+    for v in tree.values():
+        if isinstance(v, dict):
+            total += _count_files(v)
+        else:
+            # Treat any non-dict leaf as a file (S3Object or unexpected type)
+            total += 1
+    return total
+
+
+def _render_file_browser(client: S3Client) -> None:
+    """Render the folder tree browser with expandable directories and download buttons.
+
+    Fetches all objects from S3, optionally filters them by the search input,
+    builds a folder hierarchy, and displays it using nested expanders.
 
     Args:
         client: An authenticated S3Client instance.
@@ -145,7 +292,7 @@ def _render_file_browser(client: S3Client) -> None:
     st.subheader("Files" + (f" — `{prefix}`" if prefix else ""))
 
     search = st.text_input(
-        "Filter by name",
+        "🔍 Filter by name",
         placeholder="Type to filter…",
         label_visibility="collapsed",
     )
@@ -171,24 +318,10 @@ def _render_file_browser(client: S3Client) -> None:
         return
 
     st.caption(f"{len(objects)} file(s) found.")
-
-    header_cols = st.columns([5, 2, 3, 2])
-    header_cols[0].markdown("**Name**")
-    header_cols[1].markdown("**Size**")
-    header_cols[2].markdown("**Last modified**")
-    header_cols[3].markdown("**Download**")
-
     st.divider()
 
-    for obj in objects:
-        cols = st.columns([5, 2, 3, 2])
-        cols[0].markdown(f"`{obj.key}`")
-        cols[1].text(_format_size(obj.size))
-        cols[2].text(obj.last_modified.strftime("%Y-%m-%d %H:%M"))
-
-        dl_key = f"dl_{obj.key}"
-        if cols[3].button("⬇ Download", key=dl_key, use_container_width=True):
-            _download_object(client, obj.key)
+    tree = _build_tree(objects, base_prefix=prefix)
+    _render_tree(tree, client, depth=0, path="")
 
 
 def _download_object(client: S3Client, key: str) -> None:
