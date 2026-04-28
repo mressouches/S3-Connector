@@ -180,7 +180,7 @@ def _build_tree(objects: List[S3Object], base_prefix: str) -> Dict:
     return tree
 
 
-def _render_file_row(obj: object, client: S3Client) -> None:
+def _render_file_row(obj: object, client: S3Client, depth: int = 0) -> None:
     """Render a single file row with name, size, date and download button.
 
     Accepts any object that exposes the S3Object attributes (key, size,
@@ -190,6 +190,7 @@ def _render_file_row(obj: object, client: S3Client) -> None:
     Args:
         obj: An S3Object (or duck-typed equivalent) to display.
         client: An authenticated S3Client for downloading.
+        depth: Nesting level; increases left indentation for hierarchy.
     """
     try:
         key: str = obj.key  # type: ignore[attr-defined]
@@ -199,8 +200,12 @@ def _render_file_row(obj: object, client: S3Client) -> None:
         logger.warning("Skipping unrecognised object in file browser: %r", obj)
         return
 
+    margin_em = max(0, depth) * 1.25
     cols = st.columns([5, 2, 3, 2])
-    cols[0].markdown(f"📄 `{_filename(key)}`")
+    cols[0].markdown(
+        f'<div style="margin-left:{margin_em}em">📄 `{_filename(key)}`</div>',
+        unsafe_allow_html=True,
+    )
     cols[1].text(_format_size(size))
     cols[2].text(last_modified.strftime("%Y-%m-%d %H:%M"))
     if cols[3].button("⬇ Download", key=f"dl_{key}", use_container_width=True):
@@ -208,13 +213,12 @@ def _render_file_row(obj: object, client: S3Client) -> None:
 
 
 def _render_tree(tree: Dict, client: S3Client, depth: int = 0, path: str = "") -> None:
-    """Recursively render a folder tree with toggle buttons for directories.
+    """Recursively render a folder tree.
 
-    Streamlit does not support nested expanders, so folders at every depth are
-    rendered as toggle buttons backed by st.session_state. Clicking a folder
-    button opens or closes it. Sub-folders are rendered recursively in an
-    indented container. Files are shown as rows with size, date, and a download
-    button.
+    Top-level folders use ``st.expander`` so the first hierarchy level opens
+    in collapsible panels. Nested folders use toggle buttons persisted in
+    ``st.session_state`` (nested expanders are avoided). Rows are indented by
+    depth; files show a document icon and folders a folder icon.
 
     Args:
         tree: Nested dict produced by _build_tree.
@@ -228,30 +232,65 @@ def _render_tree(tree: Dict, client: S3Client, depth: int = 0, path: str = "") -
     # dataclass identity issues after hot-reloads do not drop items silently.
     files = [(k, v) for k, v in sorted(tree.items()) if not isinstance(v, dict)]
 
+    if depth == 0:
+        for folder_name, subtree in folders:
+            folder_path = f"{path}/{folder_name}"
+            file_count = _count_files(subtree)
+            exp_label = (
+                f"📁  {folder_name}  —  {file_count} "
+                f"file{'s' if file_count != 1 else ''}"
+            )
+            with st.expander(exp_label, expanded=False):
+                _render_tree(subtree, client, depth + 1, folder_path)
+
+        if files:
+            margin_em = max(0, depth) * 1.25
+            header = st.columns([5, 2, 3, 2])
+            header[0].markdown(
+                f'<div style="margin-left:{margin_em}em"><strong>Name</strong></div>',
+                unsafe_allow_html=True,
+            )
+            header[1].markdown("<strong>Size</strong>", unsafe_allow_html=True)
+            header[2].markdown("<strong>Last modified</strong>", unsafe_allow_html=True)
+            header[3].markdown("<strong>Download</strong>", unsafe_allow_html=True)
+            for _, obj in files:
+                _render_file_row(obj, client, depth=depth)
+        return
+
     for folder_name, subtree in folders:
         folder_path = f"{path}/{folder_name}"
         state_key = f"folder_open_{folder_path}"
         is_open = st.session_state.get(state_key, False)
         file_count = _count_files(subtree)
         icon = "📂" if is_open else "📁"
-        # Visual indentation: use non-breaking spaces in the markdown label
-        indent = "\u00a0" * (depth * 6)
-        label = f"{indent}{icon}  {folder_name}  —  {file_count} file{'s' if file_count != 1 else ''}"
+        indent = "\u00a0" * (depth * 4)
+        label = (
+            f"{indent}{icon}  {folder_name}  —  {file_count} "
+            f"file{'s' if file_count != 1 else ''}"
+        )
 
-        if st.button(label, key=f"folder_btn_{folder_path}", use_container_width=True):
+        if st.button(
+            label,
+            key=f"folder_btn_{folder_path}",
+            use_container_width=True,
+        ):
             st.session_state[state_key] = not is_open
 
         if st.session_state.get(state_key, False):
             _render_tree(subtree, client, depth + 1, folder_path)
 
     if files:
+        margin_em = max(0, depth) * 1.25
         header = st.columns([5, 2, 3, 2])
-        header[0].markdown("**Name**")
-        header[1].markdown("**Size**")
-        header[2].markdown("**Last modified**")
-        header[3].markdown("**Download**")
+        header[0].markdown(
+            f'<div style="margin-left:{margin_em}em"><strong>Name</strong></div>',
+            unsafe_allow_html=True,
+        )
+        header[1].markdown("<strong>Size</strong>", unsafe_allow_html=True)
+        header[2].markdown("<strong>Last modified</strong>", unsafe_allow_html=True)
+        header[3].markdown("<strong>Download</strong>", unsafe_allow_html=True)
         for _, obj in files:
-            _render_file_row(obj, client)
+            _render_file_row(obj, client, depth=depth)
 
 
 def _count_files(tree: object) -> int:
@@ -282,7 +321,8 @@ def _render_file_browser(client: S3Client) -> None:
     """Render the folder tree browser with expandable directories and download buttons.
 
     Fetches all objects from S3, optionally filters them by the search input,
-    builds a folder hierarchy, and displays it using nested expanders.
+    builds a folder hierarchy with root-level expanders, indented subtrees,
+    and download buttons.
 
     Args:
         client: An authenticated S3Client instance.
